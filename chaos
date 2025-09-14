@@ -1,0 +1,287 @@
+# chaos_tester_ultimate.py
+import tkinter as tk
+from tkinter import scrolledtext, messagebox
+import threading
+import requests
+import random
+import string
+import time
+import psutil
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# ----------------------------
+# Configuration / Utilities
+# ----------------------------
+REQUEST_TIMEOUT = 2.0
+RETRY_INTERVAL = 0.3
+GRAPH_UPDATE_INTERVAL_MS = 300  # Faster graph updates
+
+def random_payload():
+    """Huge, complex payload for stress testing."""
+    return {
+        "int": random.randint(1, 1000000),
+        "float": random.random() * 10000,
+        "text": ''.join(random.choices(string.ascii_letters + string.digits, k=5000)),
+        "list": [random.randint(1,1000) for _ in range(50)],
+        "nested": {
+            "a": random.random(),
+            "b": ''.join(random.choices(string.ascii_letters, k=100))
+        }
+    }
+
+# ----------------------------
+# Target Controller
+# ----------------------------
+class TargetController:
+    def __init__(self, get_ordered_urls_fn, log_fn):
+        self.get_ordered_urls = get_ordered_urls_fn
+        self.log = log_fn
+        self.lock = threading.Lock()
+        self.current_target = None
+        self.url_status = {}
+        self._stop = False
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread.start()
+
+    def _probe(self, url):
+        try:
+            requests.head(url, timeout=REQUEST_TIMEOUT)
+            return True
+        except:
+            return False
+
+    def _monitor_loop(self):
+        while not self._stop:
+            ordered = self.get_ordered_urls()
+            if not ordered:
+                with self.lock:
+                    self.current_target = None
+                time.sleep(RETRY_INTERVAL)
+                continue
+
+            for u in ordered:
+                self.url_status[u] = self._probe(u)
+
+            chosen = None
+            for u in ordered:
+                if self.url_status.get(u):
+                    chosen = u
+                    break
+
+            with self.lock:
+                prev = self.current_target
+                self.current_target = chosen
+
+            if chosen != prev:
+                if chosen is None:
+                    self.log("No URLs reachable. All down.", "down")
+                else:
+                    self.log(f"Switched target to: {chosen}", "info")
+
+            time.sleep(RETRY_INTERVAL)
+
+    def get_target(self):
+        with self.lock:
+            return self.current_target
+
+    def stop(self):
+        self._stop = True
+        self._thread.join(timeout=1)
+
+# ----------------------------
+# ChaosTester Ultimate App
+# ----------------------------
+class ChaosTesterApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("ChaosTester ULTIMATE - Local Stress Test")
+
+        # Main controls
+        tk.Label(root, text="Main URL (priority 1):").grid(row=0, column=0, sticky="w", padx=6, pady=2)
+        self.main_url_entry = tk.Entry(root, width=40)
+        self.main_url_entry.grid(row=0, column=1, sticky="w", padx=6, pady=2)
+        self.main_url_entry.insert(0, "http://127.0.0.1:8000")
+
+        tk.Label(root, text="Total Requests/Thread:").grid(row=1, column=0, sticky="w", padx=6, pady=2)
+        self.requests_entry = tk.Entry(root, width=15)
+        self.requests_entry.grid(row=1, column=1, sticky="w", padx=6, pady=2)
+        self.requests_entry.insert(0, "2000")
+
+        tk.Label(root, text="Threads:").grid(row=2, column=0, sticky="w", padx=6, pady=2)
+        self.threads_entry = tk.Entry(root, width=15)
+        self.threads_entry.grid(row=2, column=1, sticky="w", padx=6, pady=2)
+        self.threads_entry.insert(0, "100")
+
+        self.start_button = tk.Button(root, text="Start Test", command=self.start_test)
+        self.start_button.grid(row=3, column=0, padx=6, pady=6)
+        self.stop_button = tk.Button(root, text="Stop Test", command=self.stop_test, state="disabled")
+        self.stop_button.grid(row=3, column=1, padx=6, pady=6)
+
+        # Extra endpoints
+        self.url_entries = []
+        for i in range(4):
+            tk.Label(root, text=f"Extra URL {i+2}:").grid(row=4+i, column=0, sticky="w", padx=6, pady=2)
+            entry = tk.Entry(root, width=40)
+            entry.grid(row=4+i, column=1, sticky="w", padx=6, pady=2)
+            self.url_entries.append(entry)
+
+        # Log area
+        self.log_area = scrolledtext.ScrolledText(root, width=70, height=20, state="normal")
+        self.log_area.grid(row=8, column=0, columnspan=2, pady=8, padx=6, sticky="nw")
+        self.log_area.tag_config("info", foreground="blue")
+        self.log_area.tag_config("down", foreground="red")
+
+        # Graph area
+        self.fig = Figure(figsize=(9,6))
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("Response Times (seconds)")
+        self.ax.set_xlabel("Request #")
+        self.ax.set_ylabel("Time (s)")
+        self.canvas = FigureCanvasTkAgg(self.fig, master=root)
+        self.canvas.get_tk_widget().grid(row=0, column=2, rowspan=12, padx=8, pady=8, sticky="nsew")
+
+        root.grid_columnconfigure(2, weight=1)
+        root.grid_rowconfigure(8, weight=1)
+
+        # Internal state
+        self.testing = False
+        self.worker_threads = []
+        self.response_times = {}
+        self.rt_lock = threading.Lock()
+
+        # Controller
+        self.controller = TargetController(self.get_ordered_urls, self.log)
+        self.root.after(GRAPH_UPDATE_INTERVAL_MS, self.update_graph_periodic)
+
+        # CPU/RAM monitoring
+        self.cpu_label = tk.Label(root, text="CPU: 0%")
+        self.cpu_label.grid(row=12, column=0, sticky="w", padx=6)
+        self.ram_label = tk.Label(root, text="RAM: 0%")
+        self.ram_label.grid(row=12, column=1, sticky="w", padx=6)
+        self.root.after(500, self.update_system_usage)
+
+    # ----------------------------
+    # Helper Methods
+    # ----------------------------
+    def get_ordered_urls(self):
+        urls = []
+        main = self.main_url_entry.get().strip()
+        if main:
+            urls.append(main)
+        for entry in self.url_entries:
+            u = entry.get().strip()
+            if u:
+                urls.append(u)
+        return urls
+
+    def log(self, msg, tag=None):
+        ts = time.strftime("%H:%M:%S")
+        if tag:
+            self.log_area.insert(tk.END, f"[{ts}] {msg}\n", tag)
+        else:
+            self.log_area.insert(tk.END, f"[{ts}] {msg}\n")
+        self.log_area.see(tk.END)
+
+    # ----------------------------
+    # Test Control
+    # ----------------------------
+    def start_test(self):
+        if self.testing:
+            messagebox.showinfo("Already running", "Test already in progress.")
+            return
+        try:
+            total_requests = int(self.requests_entry.get())
+            threads_count = int(self.threads_entry.get())
+        except Exception:
+            messagebox.showerror("Input error", "Enter valid positive integers.")
+            return
+
+        urls = self.get_ordered_urls()
+        if not urls:
+            messagebox.showerror("No URLs", "Enter at least one URL.")
+            return
+
+        with self.rt_lock:
+            self.response_times = {u: [] for u in urls}
+
+        self.testing = True
+        self.start_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.log("Starting ULTIMATE test...", "info")
+
+        self.worker_threads = []
+        for i in range(threads_count):
+            t = threading.Thread(target=self._worker_loop, args=(total_requests,), daemon=True)
+            self.worker_threads.append(t)
+            t.start()
+
+    def stop_test(self):
+        if not self.testing:
+            return
+        self.testing = False
+        self.start_button.config(state="normal")
+        self.stop_button.config(state="disabled")
+        self.log("Stopping test threads...", "info")
+        time.sleep(0.2)
+        self.log("ULTIMATE test stopped.", "info")
+
+    # ----------------------------
+    # Worker Loop
+    # ----------------------------
+    def _worker_loop(self, total_requests_per_thread):
+        for _ in range(total_requests_per_thread):
+            if not self.testing:
+                break
+            target = self.controller.get_target()
+            if not target:
+                time.sleep(RETRY_INTERVAL)
+                continue
+            try:
+                payload = random_payload()
+                start = time.time()
+                resp = requests.post(target, json=payload, timeout=REQUEST_TIMEOUT)
+                elapsed = time.time() - start
+                with self.rt_lock:
+                    self.response_times.setdefault(target, []).append(elapsed)
+                self.log(f"URL: {target} | Status: {resp.status_code} | Time: {elapsed:.3f}s", "info")
+                time.sleep(random.uniform(0, 0.01))  # minimal delay
+            except requests.exceptions.RequestException as e:
+                self.log(f"Website might be down: {target} | Error: {e}", "down")
+                time.sleep(RETRY_INTERVAL)
+
+    # ----------------------------
+    # Graph and System Monitoring
+    # ----------------------------
+    def update_graph_periodic(self):
+        with self.rt_lock:
+            self.ax.clear()
+            self.ax.set_title("Response Times (seconds)")
+            self.ax.set_xlabel("Request #")
+            self.ax.set_ylabel("Time (s)")
+            for url, times in self.response_times.items():
+                if times:
+                    self.ax.plot(times, label=url)
+            self.ax.legend(loc="upper right", fontsize="small")
+            self.canvas.draw()
+        self.root.after(GRAPH_UPDATE_INTERVAL_MS, self.update_graph_periodic)
+
+    def update_system_usage(self):
+        cpu = psutil.cpu_percent()
+        ram = psutil.virtual_memory().percent
+        self.cpu_label.config(text=f"CPU: {cpu}%")
+        self.ram_label.config(text=f"RAM: {ram}%")
+        self.root.after(500, self.update_system_usage)
+
+    def close(self):
+        self.controller.stop()
+        self.root.destroy()
+
+# ----------------------------
+# Run the App
+# ----------------------------
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ChaosTesterApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.close)
+    root.mainloop()
